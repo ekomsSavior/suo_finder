@@ -1,5 +1,5 @@
 # suo_finder
-python script that searches for malicous .suo files
+python script that searches for "potential" malicous .suo files
 
 
  How to Install
