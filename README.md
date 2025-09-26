@@ -1,133 +1,216 @@
 # suo_finder
 
-Python tools to **search GitHub for potential malicious `.suo` files** and triage them safely for reporting/research.
-All scanning is **read-only**: the scripts **never deserialize** or execute anything; they just fetch bytes and look for harmless string/byte patterns.
+Python tools to **search GitHub for potential malicious `.suo` files**, then **triage them safely** for research and responsible reporting.
+
+All scanning is **read-only**: the tools **never deserialize** or execute anything; they fetch bytes and look for harmless string/byte patterns.
 
 ---
 
-## Why look at `.suo` files?
+## Why `.suo`?
 
-* **What is a `.suo`?**
-  Visual Studio **Solution User Options** file. It stores *user-specific* state (breakpoints, window layout, recent files, etc.). It is **not** source code, and it’s **not** used by VS Code. Historically it’s a **binary** file and should usually **not** be committed to a repo.
+**What is a `.suo`?**
+Visual Studio **Solution User Options**. It stores user-specific state (breakpoints, layout, MRU lists). It’s typically **binary** and shouldn’t live in source repos.
 
-* **How attackers abuse it**
-  `.suo` files can be:
+**Why scan them?**
+Attackers can hide **opaque blobs** (secrets, indicators, staged payloads) in `.suo` files where reviews are lax. You can also find **serialized .NET strings** (e.g., `BinaryFormatter`, `ObjectDataProvider`) that *hint* at past serialization activity. None of this auto-execs; it’s just a **signal** to investigate **safely**.
 
-  * Used to **stash opaque binary blobs** (exfil data, secrets, staged payloads) inside a repo where reviewers don’t look closely.
-  * Contain **serialized .NET object metadata** (strings such as `BinaryFormatter`, `ObjectDataProvider`) that *may* hint a tool once serialized complex objects into it. That doesn’t auto-execute; it’s just a **signal** for deeper manual review.
-  * Planted in **malware-adjacent repos** (e.g., RAT/hVNC loaders) as a place to hide indicators (URLs/IPs/base64 blobs).
-
-> ⚠️ **Important**: Opening a `.suo` in Visual Studio **does not inherently auto-run code**. The risk is *operational* (smuggling & confusion) and *tooling-dependent* (unsafe deserializers in custom tools). Treat suspicious `.suo` as untrusted binary and analyze offline.
+> Opening a `.suo` in Visual Studio **does not inherently auto-run code**. Treat suspicious `.suo` as **untrusted binaries** and analyze offline.
 
 ---
 
-## What’s in this repo?
+## What’s in this repo
 
-* `suo_finder.py` – finds `.suo` files via GitHub search and flags ones with **serialization-like strings**. Also pulls **commit metadata** (author/date/SHA/message).
-* `suo_ranker.py` – everything above **plus** a **risk score** and reasons (binary vs XML, serialization markers, URLs/IPs/base64, high entropy, repo keywords like `hvnc/rat/loader`, etc.). Outputs a ranked CSV for quick triage.
+* **`suo_finder.py`** — Searches GitHub for `.suo` files, flags **serialization-like strings**, and adds **commit metadata** (author/date/SHA/message).
 
-Both scripts:
+  * Extended output columns (context-aware):
 
-* Only read public GitHub content.
-* Never deserialize or execute anything.
-* Write CSV output you can safely review.
+    * `context_hits` — repo/path/commit message hits for keywords like `hvnc,rat,loader,botnet,…`
+    * `readme_poc` / `readme_poc_terms` / `readme_excerpt` — best-effort README scan for *PoC/educational* disclaimers
+    * `vs_exec_indicators` — best-effort repo-wide code search for Visual Studio **open/compile** risk primitives (e.g., `PreBuildEvent`, `#import "script:`, `COMFileReference`, `helpstringdll`, `.tlb`)
+  * Skips obvious **SVNBridge XML placeholders** by default (toggle with `--include-xml`).
+
+* **`suo_ranker.py`** — Optional: adds a **heuristic risk score** (binary vs XML, serialization markers, URLs/IPs/base64, entropy, repo keywords) and reasons, for quick sorting.
+
+* **`triage_finder_csv.py`** — Reads Finder/Ranker CSVs, downloads a **small subset** of artifacts, and writes a **redacted Markdown report** to `notes/REPORT.md`.
+
+  * Saves raw bytes into `raw/` for offline inspection (never execute).
+
+Repo example layout:
+
+```
+suo_finder/
+├── suo_finder.py
+├── suo_ranker.py
+├── triage_finder_csv.py
+├── suo_candidates_with_commits.csv
+├── raw/              # fetched samples (binary) – do not run/open in VS
+└── notes/REPORT.md   # redacted triage report for sharing/reporting
+```
 
 ---
 
-## Installation
+## Install
 
 ```bash
 git clone https://github.com/ekomsSavior/suo_finder.git
 cd suo_finder
 ```
+
 ---
 
 ## Auth / Rate limits
 
-Create a Personal Access Token on your github account with **no scopes** (or `public_repo` only if GitHub forces a scope). Short expiry is best.
+Create a short-lived GitHub token (no scopes needed for public search):
 
 ```bash
 export GITHUB_TOKEN="ghp_your_token_here"
-# quick sanity check:
 curl -sS -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user
 ```
 
-> Even with a token, GitHub’s **code search** endpoint is throttled (≈10 req/min). File/commit fetches use the higher REST limit (up to ~5k/hr).
+* **Code search**: ~10 requests/min (GitHub throttle)
+* **Other REST** (file/commit): up to ~5k/hr
+  Use `--pause` to be polite.
 
 ---
 
-## Quick Start
+## Quick start (3 steps)
 
-### Finder 
+### 1) Finder — collect candidates
 
 ```bash
-python3 suo_finder.py --max 100
+# skip obvious SVNBridge XML placeholders (default)
+python3 suo_finder.py --max 150
+
+# include XML placeholders too (optional)
+python3 suo_finder.py --max 150 --include-xml
+
+# refine “context” keywords (optional)
+python3 suo_finder.py --max 150 --context "hvnc,rat,loader,c2,backdoor,tinynuke"
 ```
 
-### Ranker (risk-scored triage)
+**Finder CSV columns** (core):
+
+```
+repo,path,html_url,matches,preview,
+commit_sha,commit_author_login,commit_author_name,commit_author_email,
+commit_date,commit_message,commit_url
+```
+
+**Extended columns** (if using the bundled extended finder):
+
+```
+context_hits,readme_poc,readme_poc_terms,readme_excerpt,vs_exec_indicators
+```
+
+---
+
+### 2) Triage — fetch a *small* subset & produce a redacted report
+
+```bash
+# analyze up to 12 rows from the finder CSV and write notes/REPORT.md
+python3 triage_finder_csv.py --csv suo_candidates_with_commits.csv --max-files 12
+
+# include XML/SVNBridge placeholders too (optional)
+python3 triage_finder_csv.py --csv suo_candidates_with_commits.csv --max-files 12 --include-xml
+```
+
+This will create:
+
+* `raw/<owner_repo>__<path>` — raw bytes (up to a safe size cap)
+* `notes/REPORT.md` — **redacted** evidence per item:
+
+  * Repo, path, HTML/commit links, author/date
+  * `matches` (serialization strings)
+  * Redacted **URLs/IPs** and **base64-like** counts (not full IOCs)
+  * A ~300-byte **safe preview** (text only; redacted)
+
+> The triage script never deserializes or executes content. It just reads bytes, extracts harmless strings, and redacts sensitive bits.
+
+---
+
+### 3) (Optional) Ranker — add a quick suspicion score
 
 ```bash
 python3 suo_ranker.py --max 300 --min-score 3
+python3 -u suo_ranker.py --max 300 --min-score 3   # unbuffered live output
 ```
 
-**Useful flags (ranker):**
+**Ranker CSV fields** add: `score`, `reasons`, `urls`, `ips`, `b64_preview`, `entropy`.
 
-* `--include-xml`  Include likely-benign SVNBridge XML `.suo` placeholders.
-* `--outfile FILE` Choose output CSV name.
-* `--per-page N`   GitHub search page size (default 30).
-* `--pause SECS`   Delay between search pages (rate-limit friendly).
+---
 
-Run unbuffered to see progress immediately:
+## Interpreting results
+
+* **PoC / research repos** (e.g., explicit “for learning/recoded” in README):
+
+  * `readme_poc=yes`, meaningful `context_hits`, usually empty `vs_exec_indicators`.
+  * Keep as educational examples; generally **deprioritize for reporting**.
+
+* **Benign leftovers** (SVNBridge/XML):
+
+  * XML previews, `readme_poc=no`, empty `context_hits` and `vs_exec_indicators`.
+  * Ignore.
+
+* **Potential abuse / supply-chain-ish**:
+
+  * `readme_poc=no`, normal-looking repo name, but **non-empty `vs_exec_indicators`** (e.g., `prebuild_or_postbuild`, `powershell_bypass`, `import_script_moniker`, `comfile_reference`, `helpstringdll`, `tlb_ref`).
+  * **Prioritize for manual review** and likely **report**.
+
+A simple quick-rank from Finder output:
 
 ```bash
-python3 -u suo_ranker.py --max 300 --min-score 3
+awk -F, 'BEGIN{OFS=","}
+NR==1{print $0",risk_score"; next}
+{
+  score=0
+  if($17!="") score+=5;           # vs_exec_indicators (col 17)
+  if($13!="") score+=3;           # context_hits (col 13)
+  if($14=="yes") score-=3;        # readme_poc (col 14)
+  print $0,score
+}' suo_candidates_with_commits.csv | sort -t, -k18,18nr | column -s, -t | sed -n "1,20p"
 ```
 
 ---
 
-## Output fields (ranker)
+## Safe manual review (defensive only)
 
-`score` – Higher = more suspicious (**heuristic**, not proof).
-`reasons` – Why it was scored (e.g., `binary,serialization_markers,urls_present,repo_ctx:hvnc`).
-`matches` – Serialization-related strings seen in the bytes (safe).
-`urls` / `ips` – Extracted indicators (truncated for safety).
-`b64_preview` – Starts of long base64-like blobs (truncated).
-`entropy` – Byte entropy estimate (≈0–8). Higher in binary/packed content.
-`repo`, `path`, `html_url` – Where it was found.
-Commit context: `commit_sha`, `commit_author_*`, `commit_date`, `commit_message`, `commit_url`.
+Inside an **isolated VM**:
 
----
+```bash
+# metadata & type
+file raw/*
 
-## Triage tips (defensive only)
+# quick strings preview
+for f in raw/*; do echo "---- $f ----"; strings -a "$f" | head -n 50; done
 
-1. **Start with top scores**; cross-check `reasons`.
-2. **Binary + serialization markers** are higher interest than XML placeholders.
-3. Look for **URLs/IPs/base64 blobs** that seem like C2/download endpoints.
-4. Check **commit message / author** context and repo theme (e.g., `hVNC`, `RAT`, `loader`).
-5. **Do not** deserialize. For manual review, use `strings`, `hexdump`, `xxd`, `binwalk` inside an **isolated VM**.
+# indicators (redacted in public reports)
+for f in raw/*; do
+  echo "---- $f ----"
+  strings -a "$f" | grep -Eoi 'https?://[^"<> ]+' | sort -u       # URLs
+  strings -a "$f" | grep -Eo '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b'    # IPs
+  strings -a "$f" | grep -E '[A-Za-z0-9+/=]{40,}' | head -n 3     # base64-like
+done
+```
+
+Never deserialize. Never open in Visual Studio. Capture only links/SHAs/previews.
 
 ---
 
 ## Responsible reporting
 
-* Gather immutable evidence (links, commit SHAs, redacted previews).
-* Report via GitHub’s **abuse/security** flows.
-* Optional: coordinate with relevant CERT if active harm is likely.
-* For public write-ups, **redact** sensitive indicators; focus on methodology and remediation.
+1. Gather immutable evidence:
+
+   * Repo/path `html_url`, commit URL, **commit SHA**
+   * Redacted preview and indicator counts from `notes/REPORT.md`
+2. Submit via GitHub’s **abuse/security** flow.
+3. In public write-ups, **redact** sensitive IOCs and emphasize **methodology** and **remediation**.
+
 
 ---
 
-## Limitations
+## Ethics
 
-* Heuristics can produce **false positives** (especially SVNBridge XML `.suo` artifacts).
-* No exploitation, no deserialization — by design.
-* Code search throttling can slow large scans; use `--max` and be polite with `--pause`.
-
-
-## Safety & ethics
-
-only use on networks and systems you have permission to test on.
-use responsibly.
-
----
+* Analyze only data you’re permitted to.
+* Keep research defensive.
+* Share responsibly.
 
